@@ -29,6 +29,7 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 
 # 导入本地模块
@@ -63,7 +64,10 @@ class Trainer:
         padding_id: int = 0,
         log_interval: int = 50,
         eval_interval: int = 500,
-        save_dir: str = "./checkpoints"
+        save_dir: str = "./checkpoints",
+        use_mixed_precision: bool = False,
+        use_neg_sampling: bool = False,
+        num_neg_samples: int = 100
     ):
         """
         初始化训练器
@@ -81,6 +85,9 @@ class Trainer:
             log_interval: 日志打印间隔（步数）
             eval_interval: 验证间隔（步数）
             save_dir: 检查点保存目录
+            use_mixed_precision: 是否使用混合精度训练
+            use_neg_sampling: 是否使用负采样
+            num_neg_samples: 负采样数量
         """
         self.model = model
         self.train_loader = train_loader
@@ -91,6 +98,12 @@ class Trainer:
         self.eval_interval = eval_interval
         self.save_dir = save_dir
         self.gradient_clip_val = gradient_clip_val
+        self.use_mixed_precision = use_mixed_precision
+        self.use_neg_sampling = use_neg_sampling
+        self.num_neg_samples = num_neg_samples
+
+        # 混合精度训练的 GradScaler
+        self.scaler = GradScaler() if use_mixed_precision else None
 
         # 优化器：AdamW
         self.optimizer = optim.AdamW(
@@ -150,31 +163,83 @@ class Trainer:
         input_seq = batch['input_seq'].to(self.device)  # [batch_size, seq_len]
         targets = batch['target'].to(self.device)  # [batch_size]
 
-        # 前向传播
-        # output: [batch_size, vocab_size]
-        output = self.model(input_seq)
+        if self.use_mixed_precision:
+            with autocast():
+                output = self.model(input_seq)
+                if self.use_neg_sampling:
+                    loss = self._compute_neg_sampling_loss(output, targets)
+                else:
+                    loss = self.criterion(output, targets)
 
-        # 计算损失
-        # 注意：这里我们只预测最后一个位置的歌曲
-        # 如果模型输出是 [batch_size, vocab_size]，直接与 targets 计算
-        loss = self.criterion(output, targets)
+            self.optimizer.zero_grad()
+            self.scaler.scale(loss).backward()
 
-        # 反向传播
-        self.optimizer.zero_grad()
-        loss.backward()
+            if self.gradient_clip_val > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.gradient_clip_val
+                )
 
-        # 梯度裁剪
-        if self.gradient_clip_val > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.gradient_clip_val
-            )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            output = self.model(input_seq)
 
-        # 更新参数
-        self.optimizer.step()
+            if self.use_neg_sampling:
+                loss = self._compute_neg_sampling_loss(output, targets)
+            else:
+                loss = self.criterion(output, targets)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+
+            if self.gradient_clip_val > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.gradient_clip_val
+                )
+
+            self.optimizer.step()
+
         self.scheduler.step()
 
         return loss.item()
+
+    def _compute_neg_sampling_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        计算负采样损失（基于 Cross Entropy）
+
+        Args:
+            logits: 模型输出的 logits, [batch_size, vocab_size]
+            targets: 目标歌曲ID, [batch_size]
+
+        Returns:
+            loss: 损失值
+        """
+        batch_size = targets.size(0)
+
+        # 对于每个样本，随机采样负样本
+        with torch.no_grad():
+            # 获取正样本的 logits
+            pos_logits = logits.gather(1, targets.unsqueeze(1)).squeeze(1)  # [batch_size]
+
+            # 采样负样本
+            neg_samples_list = []
+            for _ in range(self.num_neg_samples):
+                neg_idx = torch.randint(1, logits.size(1), (batch_size,), device=logits.device)
+                neg_samples_list.append(neg_idx)
+
+            neg_indices = torch.stack(neg_samples_list, dim=1)  # [batch_size, num_neg_samples]
+
+            # 计算负样本的 logits
+            neg_logits = logits.gather(1, neg_indices)  # [batch_size, num_neg_samples]
+
+        # 计算损失：-log(sigmoid(pos_logit)) - sum(log(1 - sigmoid(neg_logit)))
+        pos_loss = -torch.log(torch.sigmoid(pos_logits) + 1e-8).mean()
+        neg_loss = -torch.log(1 - torch.sigmoid(neg_logits) + 1e-8).mean()
+
+        return pos_loss + neg_loss
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
@@ -332,7 +397,11 @@ def train(
     gradient_clip_val: float = 1.0,
     log_interval: int = 50,
     eval_interval: int = 500,
-    save_dir: str = "./checkpoints"
+    save_dir: str = "./checkpoints",
+    use_weight_tying: bool = False,
+    use_mixed_precision: bool = False,
+    use_neg_sampling: bool = False,
+    num_neg_samples: int = 100
 ):
     """
     主训练函数
@@ -371,11 +440,15 @@ def train(
         num_layers=num_layers,
         num_heads=num_heads,
         max_seq_len=max_seq_len,
+        use_weight_tying=use_weight_tying,
         device=device
     )
 
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    print(f"Weight Tying: {use_weight_tying}")
+    print(f"混合精度训练: {use_mixed_precision}")
+    print(f"负采样: {use_neg_sampling} (num_neg_samples={num_neg_samples})")
     print()
 
     # 打印配置
@@ -399,7 +472,10 @@ def train(
         gradient_clip_val=gradient_clip_val,
         log_interval=log_interval,
         eval_interval=eval_interval,
-        save_dir=save_dir
+        save_dir=save_dir,
+        use_mixed_precision=use_mixed_precision,
+        use_neg_sampling=use_neg_sampling,
+        num_neg_samples=num_neg_samples
     )
 
     # 训练循环
@@ -452,6 +528,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_size", type=int, default=64, help="隐向量维度")
     parser.add_argument("--num_layers", type=int, default=2, help="Transformer层数")
     parser.add_argument("--num_heads", type=int, default=4, help="注意力头数")
+    parser.add_argument("--use_weight_tying", action="store_true", help="使用权重绑定")
 
     # 训练参数
     parser.add_argument("--num_epochs", type=int, default=10, help="训练轮数")
@@ -459,6 +536,9 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="权重衰减")
     parser.add_argument("--warmup_steps", type=int, default=100, help="预热步数")
     parser.add_argument("--gradient_clip_val", type=float, default=1.0, help="梯度裁剪阈值")
+    parser.add_argument("--use_mixed_precision", action="store_true", help="使用混合精度训练")
+    parser.add_argument("--use_neg_sampling", action="store_true", help="使用负采样")
+    parser.add_argument("--num_neg_samples", type=int, default=100, help="负采样数量")
 
     # 其他参数
     parser.add_argument("--log_interval", type=int, default=50, help="日志打印间隔")
@@ -483,5 +563,9 @@ if __name__ == "__main__":
         gradient_clip_val=args.gradient_clip_val,
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
-        save_dir=args.save_dir
+        save_dir=args.save_dir,
+        use_weight_tying=args.use_weight_tying,
+        use_mixed_precision=args.use_mixed_precision,
+        use_neg_sampling=args.use_neg_sampling,
+        num_neg_samples=args.num_neg_samples
     )

@@ -228,13 +228,17 @@ class ActionHead(nn.Module):
     - 通过线性层输出词表大小的 logits
     - 后续通过 softmax 得到每个歌曲的概率分布
 
-    这对应于具身智能中的"基于当前状态选择动作"。
+    可选的 Weight Tying：
+    - 当 use_weight_tying=True 时，输出层与输入 Embedding 共享权重
+    - 这在 NLP 中是常见技巧，可减少参数量并提升性能
+    - 公式：logits = hidden_states @ embedding.weight.T
     """
 
     def __init__(
         self,
         hidden_size: int,
-        vocab_size: int
+        vocab_size: int,
+        token_embedding: Optional[nn.Module] = None
     ):
         """
         初始化动作预测头
@@ -242,16 +246,20 @@ class ActionHead(nn.Module):
         Args:
             hidden_size: StateEncoder 输出的隐向量维度
             vocab_size: 歌曲ID的词表大小（用于预测）
+            token_embedding: 可选的 TokenEmbedding 层（用于 weight tying）
         """
         super().__init__()
 
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
+        self.use_weight_tying = token_embedding is not None
+        self.token_embedding = token_embedding
 
-        # 动作预测层：将隐向量映射为词表大小的 logits
-        # 输入: [batch_size, hidden_size]
-        # 输出: [batch_size, vocab_size]
-        self.action_layer = nn.Linear(hidden_size, vocab_size, bias=True)
+        if not self.use_weight_tying:
+            # 动作预测层：将隐向量映射为词表大小的 logits
+            self.action_layer = nn.Linear(hidden_size, vocab_size, bias=True)
+        else:
+            self.action_layer = None
 
     def forward(
         self,
@@ -272,13 +280,14 @@ class ActionHead(nn.Module):
         batch_size, seq_len, hidden_size = state_representation.shape
 
         # 取序列最后一个时间步的隐向量作为当前状态的表征
-        # 这在推荐场景中表示"根据历史行为预测下一步"
-        # [batch_size, seq_len, hidden_size] -> [batch_size, hidden_size]
         current_state = state_representation[:, -1, :]
 
-        # 通过线性层得到动作 logits
-        # [batch_size, hidden_size] -> [batch_size, vocab_size]
-        action_logits = self.action_layer(current_state)
+        if self.use_weight_tying:
+            # Weight Tying: logits = hidden_state @ embedding.weight.T
+            # 等价于计算 current_state 与所有 embedding 之间的相似度
+            action_logits = F.linear(current_state, self.token_embedding.weight)
+        else:
+            action_logits = self.action_layer(current_state)
 
         return action_logits
 
@@ -297,6 +306,9 @@ class VLA4RecBaseline(nn.Module):
     - StateEncoder: 将歌曲ID序列编码为状态表征
     - ActionHead: 基于状态表征生成动作（预测下一首歌）
 
+    可选功能：
+    - Weight Tying: Embedding 和 Output 层共享权重，减少参数量
+
     这种解耦设计支持后续扩展：
     - 可以在 StateEncoder 前后拼接视觉/文本编码器
     - 可以将离散的 Semantic ID 替换为连续的特征向量
@@ -310,7 +322,8 @@ class VLA4RecBaseline(nn.Module):
         num_heads: int = 4,
         intermediate_size: Optional[int] = None,
         dropout: float = 0.1,
-        max_seq_len: int = 50
+        max_seq_len: int = 50,
+        use_weight_tying: bool = False
     ):
         """
         初始化 VLA4Rec 基线模型
@@ -323,11 +336,13 @@ class VLA4RecBaseline(nn.Module):
             intermediate_size: FFN 中间层维度
             dropout: Dropout 概率
             max_seq_len: 最大序列长度
+            use_weight_tying: 是否使用权重绑定（Embedding与Output共享）
         """
         super().__init__()
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
+        self.use_weight_tying = use_weight_tying
 
         # 解耦设计：StateEncoder 和 ActionHead 独立初始化
         self.state_encoder = StateEncoder(
@@ -340,9 +355,11 @@ class VLA4RecBaseline(nn.Module):
             max_seq_len=max_seq_len
         )
 
+        # ActionHead：如果使用 weight tying，传入 token_embedding
         self.action_head = ActionHead(
             hidden_size=hidden_size,
-            vocab_size=vocab_size
+            vocab_size=vocab_size,
+            token_embedding=self.state_encoder.token_embedding if use_weight_tying else None
         )
 
         # 权重初始化
@@ -432,6 +449,7 @@ def create_baseline_model(
     num_heads: int = 4,
     dropout: float = 0.1,
     max_seq_len: int = 50,
+    use_weight_tying: bool = False,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ) -> Tuple[VLA4RecBaseline, dict]:
     """
@@ -444,6 +462,7 @@ def create_baseline_model(
         num_heads: 注意力头数
         dropout: Dropout 概率
         max_seq_len: 最大序列长度
+        use_weight_tying: 是否使用权重绑定
         device: 设备（'cuda' 或 'cpu'）
 
     Returns:
@@ -456,7 +475,8 @@ def create_baseline_model(
         num_layers=num_layers,
         num_heads=num_heads,
         dropout=dropout,
-        max_seq_len=max_seq_len
+        max_seq_len=max_seq_len,
+        use_weight_tying=use_weight_tying
     )
 
     config = {
@@ -465,7 +485,8 @@ def create_baseline_model(
         'num_layers': num_layers,
         'num_heads': num_heads,
         'dropout': dropout,
-        'max_seq_len': max_seq_len
+        'max_seq_len': max_seq_len,
+        'use_weight_tying': use_weight_tying
     }
 
     model = model.to(device)
