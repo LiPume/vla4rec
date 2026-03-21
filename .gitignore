@@ -45,3 +45,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Large data files
+spotify_data/
+paper/
+uri_to_id.json
+*.zip
