@@ -20,14 +20,19 @@ from .dataset import (
     PlaylistDataset,
     collate_fn,
     create_dataloaders,
-    get_dummy_dataloaders
+    get_dummy_dataloaders,
+    create_spotify_dataloaders,
+    LazyPlaylistDataset,
+    StreamingDataLoader,
+    Vocab
 )
 
 from .model import (
     StateEncoder,
     ActionHead,
     VLA4RecBaseline,
-    create_baseline_model
+    create_baseline_model,
+    print_model_memory_usage
 )
 
 from .metrics import (
@@ -37,7 +42,7 @@ from .metrics import (
     print_metrics
 )
 
-from .train import Trainer, train
+from .train import Trainer, train, NegSamplingLoss, get_gpu_memory_info
 
 __all__ = [
     # Dataset
@@ -45,11 +50,16 @@ __all__ = [
     'collate_fn',
     'create_dataloaders',
     'get_dummy_dataloaders',
+    'create_spotify_dataloaders',
+    'LazyPlaylistDataset',
+    'StreamingDataLoader',
+    'Vocab',
     # Model
     'StateEncoder',
     'ActionHead',
     'VLA4RecBaseline',
     'create_baseline_model',
+    'print_model_memory_usage',
     # Metrics
     'compute_hit_rate',
     'compute_ndcg',
@@ -57,7 +67,9 @@ __all__ = [
     'print_metrics',
     # Train
     'Trainer',
-    'train'
+    'train',
+    'NegSamplingLoss',
+    'get_gpu_memory_info'
 ]
 
 __version__ = '0.1.0'
