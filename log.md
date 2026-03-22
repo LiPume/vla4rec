@@ -449,12 +449,132 @@ trainer.save_checkpoint("final_model.pt")
 
 ---
 
-## 八、文件变更历史
+## 九、训练速度分析与优化（2026-03-21）
+
+### 9.1 当前性能瓶颈分析
+
+根据代码分析，一个 epoch 训练 1 小时的主要瓶颈：
+
+| 瓶颈 | 原因 | 影响 |
+|------|------|------|
+| **数据遍历** | `StreamingDataLoader` 每次遍历全部 747,510 个播放列表 | ~1000 万样本/epoch |
+| **单进程加载** | `num_workers=0`，无多进程数据预处理 | CPU 成为瓶颈 |
+| **全量验证** | 每次验证遍历 50,000 样本（evaluate_model） | 每次验证耗时过长 |
+| **计算效率** | 未使用 torch.compile、Flash Attention | GPU 利用率低 |
+| **显存约束** | batch_size 受限，吞吐量低 | GPU 未充分利用 |
+
+### 9.2 优化方案
+
+#### 方案 A：数据流水线优化（最有效）
+
+```python
+# 1. 增加 num_workers（利用多核 CPU）
+DataLoader(
+    train_dataset,
+    batch_size=64,
+    num_workers=4,           # 启用多进程
+    prefetch_factor=2,        # 预取因子
+    pin_memory=True,          # 加速数据传输
+    persistent_workers=True   # 保持 worker 进程
+)
+
+# 2. 使用固定采样（每个 epoch 采样部分数据）
+# 替代全遍历，假设每 epoch 只采样 10% 的播放列表
+SAMPLE_RATIO = 0.1  # 每个 epoch 只用 10% 数据
+num_sampled = int(num_trajectories * SAMPLE_RATIO)
+```
+
+#### 方案 B：模型编译优化
+
+```python
+# PyTorch 2.0+ 编译优化（可提速 20-50%）
+model = torch.compile(model, mode="reduce-overhead")
+```
+
+#### 方案 C：训练策略优化
+
+```bash
+# 1. 增大 batch_size + 梯度累积（保持有效 batch_size）
+python -m vla4rec_baseline.train \
+    --batch_size 256 \
+    --gradient_accumulation_steps 4  # 有效 batch_size = 1024
+
+# 2. 减少验证频率
+python -m vla4rec_baseline.train \
+    --eval_interval 5000  # 从 1000 增加到 5000
+
+# 3. 使用负采样损失（计算更快）
+python -m vla4rec_baseline.train \
+    --use_neg_sampling \
+    --num_neg_samples 50
+```
+
+#### 方案 D：Flash Attention（Transformer 加速）
+
+```python
+# 在 TransformerEncoderLayer 中启用 Flash Attention
+encoder_layer = nn.TransformerEncoderLayer(
+    d_model=hidden_size,
+    nhead=num_heads,
+    dim_feedforward=intermediate_size or hidden_size * 4,
+    dropout=dropout,
+    activation='gelu',
+    batch_first=True,
+    norm_first=True,
+    # PyTorch 2.0+ 支持
+    # 使用 qkv_bias=True 配合 Flash Attention
+)
+```
+
+### 9.3 推荐优化组合
+
+**入门级（立即生效）**：
+```bash
+python -m vla4rec_baseline.train \
+    --batch_size 128 \
+    --gradient_accumulation_steps 4 \
+    --num_workers 4 \
+    --eval_interval 5000
+```
+
+**进阶级（需代码修改）**：
+1. 添加 `torch.compile()` 编译模型
+2. 启用 Flash Attention
+3. 实现 epoch 采样机制
+
+**预估效果**：
+| 优化项 | 预期提速 | 实现难度 |
+|--------|----------|----------|
+| 增大 batch_size + 梯度累积 | 2-4x | 简单 |
+| 多进程数据加载 | 1.5-2x | 简单 |
+| torch.compile | 1.2-1.5x | 中等 |
+| Epoch 采样 | 5-10x | 中等 |
+| Flash Attention | 1.3-1.8x | 中等 |
+
+### 9.4 未来多模态扩展的性能预估
+
+当加入视觉、音频、歌词模态后，训练时间预计增长：
+
+| 模态 | 预估时间增长 | 主要瓶颈 |
+|------|--------------|----------|
+| + 视觉特征 (CLIP) | 2-3x | 图像编码器 |
+| + 音频特征 (CLAP) | 3-5x | 音频编码器 |
+| + 歌词 (LLM) | 5-10x | 语言模型 |
+
+**建议**：
+1. 先在小规模数据上验证单模态
+2. 使用预训练特征提取器（冻结权重）减少训练开销
+3. 考虑使用更小的语言模型（如 DistilBERT）
+
+---
+
+## 十、文件变更历史
 
 | 日期 | 版本 | 变更内容 |
 |------|------|----------|
 | 2026-03-21 | v1.0 | 初始版本，基础架构实现 |
 | 2026-03-21 | v2.0 | 大规模稀疏ID优化：权重共享、懒加载、混合精度、负采样 |
+| 2026-03-21 | v2.1 | 新增训练速度分析与优化方案 |
 
 ---
 

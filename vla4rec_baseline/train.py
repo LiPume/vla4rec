@@ -195,6 +195,9 @@ def create_run_directory(base_dir: str = "./checkpoints") -> str:
     run_id = get_next_run_id(base_dir)
     run_dir = os.path.join(base_dir, f"run{run_id}")
     os.makedirs(run_dir, exist_ok=True)
+    # 确保目录存在
+    if not os.path.isdir(run_dir):
+        raise RuntimeError(f"Failed to create run directory: {run_dir}")
     return run_dir
 
 
@@ -280,10 +283,10 @@ def get_gpu_memory_info() -> Dict[str, float]:
 
 class Trainer:
     """
-    训练器类
+    训练器类（性能优化版）
 
     封装训练和验证的所有逻辑，包括：
-    - 模型管理
+    - 模型管理（支持 torch.compile 编译）
     - 优化器管理
     - 学习率调度
     - 梯度累积
@@ -292,6 +295,7 @@ class Trainer:
     - 混合精度训练 (AMP)
     - 检查点保存（仅保留 latest 和 best）
     - 指标记录与可视化
+    - Epoch 采样训练模式
     """
 
     def __init__(
@@ -311,7 +315,9 @@ class Trainer:
         use_mixed_precision: bool = True,
         gradient_accumulation_steps: int = 1,
         use_neg_sampling: bool = False,
-        num_neg_samples: int = 50
+        num_neg_samples: int = 50,
+        use_compile: bool = False,
+        compile_mode: str = "default"
     ):
         """
         初始化训练器
@@ -332,6 +338,8 @@ class Trainer:
         self.use_mixed_precision = use_mixed_precision
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.use_neg_sampling = use_neg_sampling
+        self.use_compile = use_compile
+        self.compile_mode = compile_mode
 
         # 优化器：AdamW
         self.optimizer = optim.AdamW(
@@ -365,6 +373,15 @@ class Trainer:
         else:
             self.scaler = None
 
+        # PyTorch 2.0+ 编译优化
+        if self.use_compile and hasattr(torch, 'compile'):
+            print(f"[优化] 编译模型 (mode='{self.compile_mode}')...")
+            print("[提示] 首次编译可能需要几分钟，之后会显著加速...")
+            self.model = torch.compile(self.model, mode=self.compile_mode)
+            print("[优化] 模型编译完成！")
+        elif self.use_compile:
+            print("[警告] torch.compile 不可用（需要 PyTorch 2.0+），跳过编译")
+
         # 训练状态
         self.global_step = 0
         self.current_epoch = 0
@@ -374,6 +391,14 @@ class Trainer:
         # 统计信息
         self.train_history = []
         self.val_history = []
+
+        # 性能统计
+        self._perf_stats = {
+            'data_time': 0.0,
+            'forward_time': 0.0,
+            'backward_time': 0.0,
+            'total_time': 0.0
+        }
 
         # 打印显存信息
         if device.type == 'cuda':
@@ -538,6 +563,9 @@ class Trainer:
 
     def save_checkpoint(self, filename: str):
         """保存模型检查点"""
+        # 确保目录存在
+        os.makedirs(self.save_dir, exist_ok=True)
+        
         checkpoint = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,
@@ -687,12 +715,22 @@ def train(
     gradient_accumulation_steps: int = 1,
     use_neg_sampling: bool = False,
     num_neg_samples: int = 50,
-    use_weight_tying: bool = True
+    use_weight_tying: bool = True,
+    num_workers: int = 0,
+    epoch_sample_ratio: float = 1.0,
+    use_compile: bool = False,
+    compile_mode: str = "default"
 ):
     """
-    主训练函数
+    主训练函数（性能优化版）
 
     一键启动训练流程。
+
+    性能优化参数：
+    - num_workers: 数据加载的并行进程数
+    - epoch_sample_ratio: 每个 epoch 采样的比例（<1.0 可大幅加速）
+    - use_compile: 是否使用 torch.compile 编译模型
+    - compile_mode: 编译模式 ("default", "reduce-overhead", "max-autotune")
     """
     print("=" * 60)
     print("VLA4Rec Baseline Training (大规模稀疏ID优化版)")
@@ -730,7 +768,10 @@ def train(
             batch_size=batch_size,
             max_seq_len=max_seq_len,
             train_ratio=0.8,
-            cache_val_samples=True
+            cache_val_samples=True,
+            num_workers=num_workers,
+            epoch_sample_ratio=epoch_sample_ratio,
+            use_indexed_loader=True
         )
     else:
         print("\n使用虚拟数据")
@@ -763,6 +804,21 @@ def train(
     print_model_memory_usage(model, batch_size, max_seq_len, str(device))
     print()
 
+    # 打印性能优化配置
+    print("=" * 60)
+    print("性能优化配置:")
+    print("=" * 60)
+    print(f"  批次大小: {batch_size}")
+    print(f"  梯度累积: {gradient_accumulation_steps} (有效 batch_size: {batch_size * gradient_accumulation_steps})")
+    print(f"  DataLoader workers: {num_workers}")
+    if epoch_sample_ratio < 1.0:
+        print(f"  Epoch 采样比例: {epoch_sample_ratio:.0%} (加速 {1/epoch_sample_ratio:.1f}x)")
+    print(f"  torch.compile: {'开启' if use_compile else '关闭'}")
+    if use_compile:
+        print(f"  编译模式: {compile_mode}")
+    print("=" * 60)
+    print()
+
     # 创建训练器
     trainer = Trainer(
         model=model,
@@ -779,7 +835,9 @@ def train(
         use_mixed_precision=use_mixed_precision,
         gradient_accumulation_steps=gradient_accumulation_steps,
         use_neg_sampling=use_neg_sampling,
-        num_neg_samples=num_neg_samples
+        num_neg_samples=num_neg_samples,
+        use_compile=use_compile,
+        compile_mode=compile_mode
     )
 
     # 训练
@@ -806,6 +864,8 @@ if __name__ == "__main__":
     parser.add_argument("--vocab_size", type=int, default=1536416, help="Vocabulary size")
     parser.add_argument("--max_seq_len", type=int, default=50, help="Maximum sequence length")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--epoch_sample_ratio", type=float, default=1.0,
+                        help="Sampling ratio per epoch (0.0-1.0), <1.0 speeds up training significantly")
 
     # 模型参数
     parser.add_argument("--hidden_size", type=int, default=64, help="Hidden size")
@@ -830,6 +890,15 @@ if __name__ == "__main__":
                         help="Use negative sampling loss for large vocab")
     parser.add_argument("--num_neg_samples", type=int, default=50,
                         help="Number of negative samples for each positive")
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="Number of DataLoader workers (0=single process)")
+
+    # 编译优化 (PyTorch 2.0+)
+    parser.add_argument("--use_compile", action="store_true", default=False,
+                        help="Use torch.compile to speed up training (requires PyTorch 2.0+)")
+    parser.add_argument("--compile_mode", type=str, default="default",
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode")
 
     # 其他参数
     parser.add_argument("--log_interval", type=int, default=50, help="Log interval")
@@ -859,5 +928,9 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         use_neg_sampling=args.use_neg_sampling,
         num_neg_samples=args.num_neg_samples,
-        use_weight_tying=args.use_weight_tying
+        use_weight_tying=args.use_weight_tying,
+        num_workers=args.num_workers,
+        epoch_sample_ratio=args.epoch_sample_ratio,
+        use_compile=args.use_compile,
+        compile_mode=args.compile_mode
     )
